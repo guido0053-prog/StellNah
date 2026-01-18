@@ -1,6 +1,6 @@
 // StellNah Service Worker (minimal)
 // Cachet die wichtigsten Dateien, damit die App "installierbar" ist.
-const CACHE = "stellnah-v1";
+const CACHE = "stellnah-v2";
 const ASSETS = [
   "./",
   "./index.html",
