@@ -12,8 +12,8 @@ from pydantic import BaseModel
 APP_NAME = "StellNah"
 
 # Kriterien (Luftlinie)
-WALK_M = 300          # Einkauf max 300 m
-CENTER_M = 1500       # zentrumsnah max 1,5 km
+WALK_M = 500          # Einkauf max 500 m
+CENTER_M = 3000       # zentrumsnah max 3 km
 
 # Umkreis pro Stellplatz für POI-Abfrage (klein & stabil)
 POI_SEARCH_M = 800
@@ -273,7 +273,7 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
             pois = safe_features_from_point(
                 (slat, slon),
                 dist=POI_SEARCH_M,
-                tags={"shop": ["bakery", "butcher", "supermarket", "convenience"]},
+                tags={"shop": ["bakery", "butcher", "supermarket", "convenience", "general", "greengrocer"]},
                 retries=1, wait_s=1
             )
         except Exception:
