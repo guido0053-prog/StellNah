@@ -2,25 +2,32 @@ import math
 from typing import List, Dict, Any
 
 import osmnx as ox
-import networkx as nx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# StellNah – POI Agent API (OpenStreetMap-basiert)
-ox.settings.use_cache = True
-ox.settings.log_console = False
+# =========================
+# StellNah – Backend (stabil, Luftlinie)
+# =========================
 
 APP_NAME = "StellNah"
-WALK_M = 350          # ca. 0,5 km (fußläufig)
-CENTER_WALK_M = 800   # zentrumsnah (~10 Min zu Fuß)
+
+# Kriterien (Luftlinie)
+WALK_M = 300          # Einkauf max. 300 m
+CENTER_M = 1500       # zentrumsnah max. 1,5 km
+
+# OSMnx stabilisieren (wichtig für Render)
+ox.settings.use_cache = True
+ox.settings.log_console = False
+ox.settings.requests_timeout = 180
+ox.settings.http_headers = {"User-Agent": "StellNah (private use)"}
 
 app = FastAPI(title=f"{APP_NAME} API")
 
-# Damit die Webseite (Frontend) das Backend aufrufen darf (CORS)
+# CORS erlauben (Frontend darf Backend aufrufen)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # für private Solo-App ok; später ggf. enger machen
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,6 +36,11 @@ app.add_middleware(
 class AnalyzeRequest(BaseModel):
     zielort: str
     suchradius_km: float
+
+
+# -------------------------
+# Hilfsfunktionen
+# -------------------------
 
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -39,15 +51,17 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
+
 def maps_search_link(q: str) -> str:
     return "https://www.google.com/maps/search/?api=1&query=" + q.replace(" ", "+")
 
+
 def find_center_poi(lat0, lon0, search_m=3000):
     """
-    Versucht, ein plausibles Stadtzentrum zu finden:
-    1) Rathaus (amenity=townhall)
-    2) Marktplatz (amenity=marketplace)
-    Falls nichts gefunden wird: Rückgabe None -> Geocode-Punkt als Zentrum.
+    Versucht ein Stadtzentrum zu finden:
+    - Rathaus
+    - Marktplatz
+    Fallback: Geocode-Punkt
     """
     candidates = []
     for tags in [{"amenity": "townhall"}, {"amenity": "marketplace"}]:
@@ -58,7 +72,7 @@ def find_center_poi(lat0, lon0, search_m=3000):
                 pts = gdf.geometry.centroid
                 for i, r in gdf.iterrows():
                     lat, lon = float(pts.iloc[i].y), float(pts.iloc[i].x)
-                    name = str(r.get("name") or "").strip() or "Zentrum"
+                    name = str(r.get("name") or "Zentrum")
                     d = haversine_m(lat0, lon0, lat, lon)
                     candidates.append((d, lat, lon, name))
         except Exception:
@@ -66,41 +80,55 @@ def find_center_poi(lat0, lon0, search_m=3000):
 
     if not candidates:
         return None
+
     candidates.sort(key=lambda x: x[0])
     _, lat, lon, name = candidates[0]
     return lat, lon, name
 
+
+# -------------------------
+# Healthcheck
+# -------------------------
+
 @app.get("/health")
 def health():
     return {"ok": True, "app": APP_NAME}
+
+
+# -------------------------
+# Analyse (Hauptfunktion)
+# -------------------------
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
     zielort = req.zielort.strip()
     radius_m = int(req.suchradius_km * 1000)
 
-    # 1) Zielort in Koordinaten umwandeln
+    # 1) Zielort geocodieren
     lat0, lon0 = ox.geocode(zielort)
 
-    # 2) Fußwegenetz im Radius laden
-    G = ox.graph_from_point((lat0, lon0), dist=radius_m, network_type="walk", simplify=True)
-    G = ox.utils_graph.get_largest_component(G, strongly=False)
-
-    # 3) Zentrum bestimmen (Rathaus/Marktplatz) – fallback Geocode-Punkt
-    cpoi = find_center_poi(lat0, lon0, search_m=3000)
+    # 2) Zentrum bestimmen
+    cpoi = find_center_poi(lat0, lon0)
     if cpoi:
         clat, clon, cname = cpoi
     else:
-        clat, clon, cname = float(lat0), float(lon0), zielort
+        clat, clon, cname = lat0, lon0, zielort
 
-    # 4) Fußweg-Distanzen vom Zentrum zu allen Knoten berechnen
-    center_node = ox.distance.nearest_nodes(G, clon, clat)
-    dist_from_center = nx.single_source_dijkstra_path_length(G, source=center_node, weight="length")
+    # 3) Stellplätze & Campingplätze
+    sites = ox.features_from_point(
+        (lat0, lon0),
+        dist=radius_m,
+        tags={"tourism": ["caravan_site", "camp_site"]}
+    )
 
-    # 5) Stellplätze & Campingplätze (OSM)
-    sites = ox.features_from_point((lat0, lon0), dist=radius_m, tags={"tourism": ["caravan_site", "camp_site"]})
     if sites.empty:
-        return {"zielort": zielort, "suchradius_km": req.suchradius_km, "zentrum": {"name": cname}, "results": []}
+        return {
+            "app": APP_NAME,
+            "zielort": zielort,
+            "suchradius_km": req.suchradius_km,
+            "zentrum": {"name": cname},
+            "results": []
+        }
 
     sites = sites.reset_index()
     sites["pt"] = sites.geometry.centroid
@@ -117,78 +145,87 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
 
     sites["typ"] = sites["tourism"].apply(typ)
 
-    # 6) POIs: Bäcker/Metzger/Supermarkt
-    pois = ox.features_from_point((lat0, lon0), dist=radius_m, tags={"shop": ["bakery", "butcher", "supermarket"]})
-    pois = pois.reset_index()
-    if pois.empty:
-        return {"zielort": zielort, "suchradius_km": req.suchradius_km, "zentrum": {"name": cname}, "results": []}
+    # 4) Einkauf-POIs
+    pois = ox.features_from_point(
+        (lat0, lon0),
+        dist=radius_m,
+        tags={"shop": ["bakery", "butcher", "supermarket"]}
+    )
 
+    if pois.empty:
+        return {
+            "app": APP_NAME,
+            "zielort": zielort,
+            "suchradius_km": req.suchradius_km,
+            "zentrum": {"name": cname},
+            "results": []
+        }
+
+    pois = pois.reset_index()
     pois["pt"] = pois.geometry.centroid
     pois["lat"] = pois["pt"].y
     pois["lon"] = pois["pt"].x
-    pois["poi_type"] = pois.get("shop", "").astype(str)
+    pois["shop"] = pois.get("shop", "").astype(str)
 
-    # 7) POI-Typen auf Netzwerkknoten mappen
-    poi_nodes = {}
-    for poi_type in ["bakery", "butcher", "supermarket"]:
-        sub = pois[pois["poi_type"] == poi_type]
-        if sub.empty:
-            poi_nodes[poi_type] = set()
-            continue
-        nodes = ox.distance.nearest_nodes(G, sub["lon"].values, sub["lat"].values)
-        poi_nodes[poi_type] = set(int(n) for n in nodes) if not isinstance(nodes, int) else {int(nodes)}
+    bakery = pois[pois["shop"] == "bakery"][["lat", "lon"]].to_dict("records")
+    butcher = pois[pois["shop"] == "butcher"][["lat", "lon"]].to_dict("records")
+    market  = pois[pois["shop"] == "supermarket"][["lat", "lon"]].to_dict("records")
 
-    # 8) Distanz zu jedem POI-Typ als Multi-Source-Dijkstra (effizient)
-    dist_by_type = {}
-    for poi_type, sources in poi_nodes.items():
-        dist_by_type[poi_type] = nx.multi_source_dijkstra_path_length(G, sources=sources, weight="length") if sources else {}
+    def min_dist(slat, slon, lst):
+        best = None
+        for p in lst:
+            d = haversine_m(slat, slon, float(p["lat"]), float(p["lon"]))
+            if best is None or d < best:
+                best = d
+        return best
 
-    # 9) Stellplätze auswerten und filtern
     results: List[Dict[str, Any]] = []
+
     for _, r in sites.iterrows():
         name = r["name"] if r["name"] else "(ohne Namen)"
-        lat, lon = float(r["lat"]), float(r["lon"])
-        node = ox.distance.nearest_nodes(G, lon, lat)
+        slat, slon = float(r["lat"]), float(r["lon"])
 
-        d_center = dist_from_center.get(node)
-        zentrumsnah = (d_center is not None and d_center <= CENTER_WALK_M)
-
-        d_bakery = dist_by_type["bakery"].get(node)
-        d_butcher = dist_by_type["butcher"].get(node)
-        d_super  = dist_by_type["supermarket"].get(node)
-
-        bakery_ok = (d_bakery is not None and d_bakery <= WALK_M)
-        butcher_ok = (d_butcher is not None and d_butcher <= WALK_M)
-        super_ok  = (d_super is not None and d_super <= WALK_M)
-
-        einkauf_ok = bakery_ok or butcher_ok or super_ok
-
-        # Deine Kriterien:
-        if not (zentrumsnah and einkauf_ok):
+        d_center = haversine_m(slat, slon, clat, clon)
+        if d_center > CENTER_M:
             continue
 
-        min_dist = min([d for d in [d_bakery, d_butcher, d_super] if d is not None], default=None)
-        q = f"{name} {zielort}"
+        d_bakery = min_dist(slat, slon, bakery)
+        d_butcher = min_dist(slat, slon, butcher)
+        d_market = min_dist(slat, slon, market)
 
+        ok = False
+        d_min = None
+
+        for d in [d_bakery, d_butcher, d_market]:
+            if d is not None and d <= WALK_M:
+                ok = True
+                d_min = d if d_min is None else min(d_min, d)
+
+        if not ok:
+            continue
+
+        q = f"{name} {zielort}"
         results.append({
             "typ": r["typ"],
             "name": name,
-            "min_fussweg_m": int(min_dist) if min_dist is not None else None,
-            "zentrum_m": int(d_center) if d_center is not None else None,
-            "baecker": bool(bakery_ok),
-            "metzger": bool(butcher_ok),
-            "supermarkt": bool(super_ok),
+            "min_einkauf_m": int(d_min),
+            "zentrum_m": int(d_center),
+            "baecker": d_bakery is not None and d_bakery <= WALK_M,
+            "metzger": d_butcher is not None and d_butcher <= WALK_M,
+            "supermarkt": d_market is not None and d_market <= WALK_M,
             "maps_link": maps_search_link(q),
         })
 
-    # Sortierung: kleinste Einkaufsdistanz zuerst
-    results.sort(key=lambda x: x["min_fussweg_m"] if x["min_fussweg_m"] is not None else 10**9)
+    results.sort(key=lambda x: x["min_einkauf_m"])
 
     return {
         "app": APP_NAME,
         "zielort": zielort,
         "suchradius_km": req.suchradius_km,
         "zentrum": {"name": cname},
-        "params": {"walk_m": WALK_M, "center_walk_m": CENTER_WALK_M},
+        "params": {
+            "einkauf_luftlinie_m": WALK_M,
+            "zentrum_luftlinie_m": CENTER_M
+        },
         "results": results,
     }
