@@ -1,8 +1,9 @@
 import math
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
+import requests
 import osmnx as ox
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +15,11 @@ APP_NAME = "StellNah"
 WALK_M = 300          # Einkauf max 300 m
 CENTER_M = 1500       # zentrumsnah max 1,5 km
 
-# Wie weit wir pro Stellplatz nach POIs suchen (kleine, schnelle Abfragen)
-POI_SEARCH_M = 1200   # 1,2 km Umkreis pro Stellplatz
+# Umkreis pro Stellplatz für POI-Abfrage (klein & stabil)
+POI_SEARCH_M = 800
 
-# Sicherheitslimit: wenn extrem viele Stellplatz-Kandidaten gefunden werden
-MAX_SITES_TO_CHECK = 60
+# Render-Free Schutz: nur die nächsten X Kandidaten prüfen (nach Nähe zum Zentrum)
+MAX_SITES_TO_CHECK = 25
 
 # OSMnx stabilisieren
 ox.settings.use_cache = True
@@ -28,9 +29,10 @@ ox.settings.http_headers = {"User-Agent": "StellNah (private use)"}
 
 app = FastAPI(title=f"{APP_NAME} API")
 
+# CORS: Frontend darf Backend aufrufen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # für private Solo-App ok
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,7 +43,11 @@ class AnalyzeRequest(BaseModel):
     suchradius_km: float
 
 
-def haversine_m(lat1, lon1, lat2, lon2):
+# -------------------------
+# Hilfsfunktionen
+# -------------------------
+
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
     R = 6371000.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
@@ -57,7 +63,7 @@ def maps_search_link(q: str) -> str:
 
 def safe_features_from_point(point, dist, tags, retries=2, wait_s=2):
     """
-    Kleine Stabilitäts-Hilfe: wenn Overpass mal zickt, versuchen wir es nochmal.
+    Overpass kann manchmal zicken. Wir versuchen es ein paar Mal.
     """
     last_err = None
     for i in range(retries + 1):
@@ -70,11 +76,48 @@ def safe_features_from_point(point, dist, tags, retries=2, wait_s=2):
     raise last_err
 
 
+def geocode_robust(query: str, retries: int = 2) -> Tuple[float, float]:
+    """
+    1) Erst normal über OSMnx/Nominatim (wie bisher)
+    2) Wenn das wegen Netzwerkproblemen scheitert: Fallback auf Photon (Komoot)
+    """
+    last = None
+    for _ in range(retries + 1):
+        try:
+            lat, lon = ox.geocode(query)
+            return float(lat), float(lon)
+        except Exception as e:
+            last = e
+            time.sleep(1.5)
+
+    # Fallback: Photon
+    try:
+        r = requests.get(
+            "https://photon.komoot.io/api/",
+            params={"q": query, "limit": 1},
+            timeout=15,
+            headers={"User-Agent": "StellNah (private use)"}
+        )
+        r.raise_for_status()
+        data = r.json()
+        feats = data.get("features", [])
+        if feats:
+            coords = feats[0]["geometry"]["coordinates"]  # [lon, lat]
+            return float(coords[1]), float(coords[0])
+    except Exception as e:
+        last = e
+
+    raise last
+
+
 def find_center_poi(lat0, lon0, search_m=3000):
+    """
+    Zentrum via Rathaus/Marktplatz versuchen.
+    """
     candidates = []
     for tags in [{"amenity": "townhall"}, {"amenity": "marketplace"}]:
         try:
-            gdf = safe_features_from_point((lat0, lon0), dist=search_m, tags=tags, retries=1)
+            gdf = safe_features_from_point((lat0, lon0), dist=search_m, tags=tags, retries=1, wait_s=1)
             if not gdf.empty:
                 gdf = gdf.reset_index()
                 pts = gdf.geometry.centroid
@@ -98,7 +141,6 @@ def normalize_sites(df: pd.DataFrame) -> pd.DataFrame:
     df["lat"] = df["pt"].y
     df["lon"] = df["pt"].x
     df["name"] = df.get("name", "").astype(str).fillna("").str.strip()
-
     if "tourism" not in df.columns:
         df["tourism"] = ""
 
@@ -108,7 +150,6 @@ def normalize_sites(df: pd.DataFrame) -> pd.DataFrame:
             return "Wohnmobilstellplatz"
         if t == "camp_site":
             return "Campingplatz"
-        # Parking-basierte Heuristik:
         return "Stellplatz (Parken)"
 
     df["typ"] = df.apply(typ_row, axis=1)
@@ -117,10 +158,8 @@ def normalize_sites(df: pd.DataFrame) -> pd.DataFrame:
 
 def is_motorhome_parking_row(r: pd.Series) -> bool:
     """
-    Heuristik: Stellplätze, die als Parkplatz getaggt sind.
-    Wir nehmen sie nur, wenn Hinweise auf Wohnmobil/Caravan existieren.
+    Parkplatz als Stellplatz-Kandidat nur, wenn Hinweise auf Wohnmobil/Caravan existieren.
     """
-    # Oft sind die Spalten als Strings vorhanden, z.B. motorhome='yes', caravan='yes'
     motorhome = str(r.get("motorhome") or "").lower()
     caravan = str(r.get("caravan") or "").lower()
     parking = str(r.get("parking") or "").lower()
@@ -132,6 +171,21 @@ def is_motorhome_parking_row(r: pd.Series) -> bool:
     return False
 
 
+def min_dist_to_pois(slat: float, slon: float, pois_df: pd.DataFrame) -> Optional[float]:
+    if pois_df is None or pois_df.empty:
+        return None
+    best = None
+    for _, p in pois_df.iterrows():
+        d = haversine_m(slat, slon, float(p["plat"]), float(p["plon"]))
+        if best is None or d < best:
+            best = d
+    return best
+
+
+# -------------------------
+# Endpunkte
+# -------------------------
+
 @app.get("/health")
 def health():
     return {"ok": True, "app": APP_NAME}
@@ -142,43 +196,47 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
     zielort = req.zielort.strip()
     radius_m = int(req.suchradius_km * 1000)
 
-    # 1) Zielort geocodieren
-    lat0, lon0 = ox.geocode(zielort)
+    # 1) Zielort robust geocodieren
+    lat0, lon0 = geocode_robust(zielort)
 
     # 2) Zentrum bestimmen
-    cpoi = find_center_poi(lat0, lon0)
+    cpoi = find_center_poi(lat0, lon0, search_m=3000)
     if cpoi:
         clat, clon, cname = cpoi
     else:
         clat, clon, cname = lat0, lon0, zielort
 
-    # 3) Stellplätze/Campingplätze: klassische Tags
-    sites_a = safe_features_from_point(
-        (lat0, lon0),
-        dist=radius_m,
-        tags={"tourism": ["caravan_site", "camp_site"]},
-        retries=2
-    )
-
-    # 4) Zusätzlich: Parkplatz-Tags (damit wir Biberach & Co. besser treffen)
-    sites_b = safe_features_from_point(
-        (lat0, lon0),
-        dist=radius_m,
-        tags={"amenity": "parking"},
-        retries=2
-    )
-
+    # 3) Stellplatz-Kandidaten sammeln
     sites_list = []
 
-    if sites_a is not None and not sites_a.empty:
-        sites_list.append(normalize_sites(sites_a))
+    # Klassische Tags
+    try:
+        sites_a = safe_features_from_point(
+            (lat0, lon0),
+            dist=radius_m,
+            tags={"tourism": ["caravan_site", "camp_site"]},
+            retries=2, wait_s=2
+        )
+        if sites_a is not None and not sites_a.empty:
+            sites_list.append(normalize_sites(sites_a))
+    except Exception:
+        pass
 
-    if sites_b is not None and not sites_b.empty:
-        tmp = normalize_sites(sites_b)
-        # nur die Parkplätze, die nach Wohnmobil aussehen
-        tmp = tmp[tmp.apply(is_motorhome_parking_row, axis=1)]
-        if not tmp.empty:
-            sites_list.append(tmp)
+    # Parking-Heuristik
+    try:
+        sites_b = safe_features_from_point(
+            (lat0, lon0),
+            dist=radius_m,
+            tags={"amenity": "parking"},
+            retries=2, wait_s=2
+        )
+        if sites_b is not None and not sites_b.empty:
+            tmp = normalize_sites(sites_b)
+            tmp = tmp[tmp.apply(is_motorhome_parking_row, axis=1)]
+            if not tmp.empty:
+                sites_list.append(tmp)
+    except Exception:
+        pass
 
     if not sites_list:
         return {
@@ -191,34 +249,32 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
 
     sites = pd.concat(sites_list, ignore_index=True)
 
-    # Duplikate entfernen (gleiche Koordinate + gleicher Name)
+    # Duplikate entfernen (Name + Koordinate)
     sites["key"] = sites["name"].fillna("") + "|" + sites["lat"].round(6).astype(str) + "|" + sites["lon"].round(6).astype(str)
     sites = sites.drop_duplicates(subset=["key"]).drop(columns=["key"])
 
-    # Sicherheitslimit, damit Render Free nicht stirbt
-    # Wir sortieren nach Nähe zum Zentrum (praktisch sinnvoll)
+    # Sortieren nach Nähe zum Zentrum und begrenzen (Render-Free Schutz)
     sites["dist_center_m"] = sites.apply(lambda r: haversine_m(float(r["lat"]), float(r["lon"]), float(clat), float(clon)), axis=1)
     sites = sites.sort_values("dist_center_m").head(MAX_SITES_TO_CHECK)
 
     results: List[Dict[str, Any]] = []
 
-    # 5) Pro Stellplatz kleine POI-Abfrage (stabiler als riesige POI-Abfrage)
+    # 4) Pro Kandidat: kleine POI-Abfrage um den Stellplatz (stabiler)
     for _, s in sites.iterrows():
         name = s["name"] if s["name"] else "(ohne Namen)"
         slat, slon = float(s["lat"]), float(s["lon"])
 
-        # zentrumsnah (Luftlinie)
         d_center = haversine_m(slat, slon, float(clat), float(clon))
         if d_center > CENTER_M:
             continue
 
-        # kleine POI-Abfrage nur um den Stellplatz
+        # POIs in kleinem Umkreis
         try:
             pois = safe_features_from_point(
                 (slat, slon),
                 dist=POI_SEARCH_M,
                 tags={"shop": ["bakery", "butcher", "supermarket", "convenience"]},
-                retries=1
+                retries=1, wait_s=1
             )
         except Exception:
             continue
@@ -232,22 +288,15 @@ def analyze(req: AnalyzeRequest) -> Dict[str, Any]:
         pois["plon"] = pois["pt"].x
         pois["shop"] = pois.get("shop", "").astype(str)
 
-        # min-Distanzen je Kategorie
-        def min_dist(shop_value: str) -> Optional[float]:
-            sub = pois[pois["shop"] == shop_value]
-            if sub.empty:
-                return None
-            best = None
-            for _, p in sub.iterrows():
-                d = haversine_m(slat, slon, float(p["plat"]), float(p["plon"]))
-                if best is None or d < best:
-                    best = d
-            return best
+        bakery_df = pois[pois["shop"] == "bakery"]
+        butcher_df = pois[pois["shop"] == "butcher"]
+        super_df = pois[pois["shop"] == "supermarket"]
+        conv_df = pois[pois["shop"] == "convenience"]
 
-        d_bakery = min_dist("bakery")
-        d_butcher = min_dist("butcher")
-        d_super = min_dist("supermarket")
-        d_conv = min_dist("convenience")
+        d_bakery = min_dist_to_pois(slat, slon, bakery_df)
+        d_butcher = min_dist_to_pois(slat, slon, butcher_df)
+        d_super = min_dist_to_pois(slat, slon, super_df)
+        d_conv = min_dist_to_pois(slat, slon, conv_df)
 
         bakery_ok = (d_bakery is not None and d_bakery <= WALK_M)
         butcher_ok = (d_butcher is not None and d_butcher <= WALK_M)
